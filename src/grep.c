@@ -119,6 +119,16 @@ static idx_t n_patterns;
 /* Hash table of patterns seen so far.  */
 static Hash_table *pattern_table;
 
+typedef struct
+{
+  char **files;
+  int front, rear, count, capacity;
+  bool done;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+}
+task_queue_t;
+
 /* Hash and compare newline-terminated patterns for textual equality.
    Patterns are represented by origin-1 offsets into PATTERN_ARRAY,
    cast to void *.  The origin-1 is so that the first pattern offset
@@ -2462,6 +2472,79 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
   return result;
 }
 
+static bool
+grep_command_line_arg (char const *arg);
+
+static void
+init_queue(task_queue_t *q, int capacity)
+{
+    q->files = malloc(sizeof(char *) * capacity);
+    q->front = 0;
+    q->rear = 0;
+    q->capacity = capacity;
+    q->count = 0;
+    q->done = false;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond, NULL);
+}
+
+static void
+enqueue(task_queue_t *q, char *file)
+{
+    pthread_mutex_lock(&q->mutex);
+    q->files[q->rear] = file;
+    q->rear = (q->rear + 1) % q->capacity;
+    q->count++;
+    pthread_cond_signal(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+static char
+*dequeue(task_queue_t *q)
+{
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == 0 && !q->done) {
+        pthread_cond_wait(&q->cond, &q->mutex);
+    }
+    if (q->count == 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return NULL;
+    }
+    char *file = q->files[q->front];
+    q->front = (q->front + 1) % q->capacity;
+    q->count--;
+    pthread_mutex_unlock(&q->mutex);
+    return file;
+}
+
+static void
+mark_done(task_queue_t *q)
+{
+    pthread_mutex_lock(&q->mutex);
+    q->done = true;
+    pthread_cond_broadcast(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+static void
+destroy_queue(task_queue_t *q)
+{
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->cond);
+    free(q->files);
+}
+
+static void
+*grep_worker(void *arg)
+{
+    task_queue_t *queue = (task_queue_t *)arg;
+    char *file;
+    while ((file = dequeue(queue)) != NULL) {
+        grep_command_line_arg(file);
+    }
+    return NULL;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2877,6 +2960,30 @@ main (int argc, char **argv)
 
   hash_free (pattern_table);
 
+  long num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+
+  if (num_threads < 1)
+    {
+      perror("sysconf");
+      num_threads = 1;
+    }
+
+  pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+  if (threads == NULL)
+    {
+      perror("malloc");
+      exit(EXIT_FAILURE);
+    }
+
+  task_queue_t queue;
+
+  init_queue(&queue, argc - optind);
+
+  for (long i = 0; i < num_threads; i++)
+    {
+      pthread_create(&threads[i], NULL, grep_worker, &queue);
+    }
+
   bool possibly_tty = false;
   struct stat tmp_stat;
   if (! exit_on_match && fstat (STDOUT_FILENO, &tmp_stat) == 0)
@@ -3029,10 +3136,24 @@ main (int argc, char **argv)
       files = stdin_only;
     }
 
+  for (int i = optind; i < argc; i++)
+    {
+      enqueue(&queue, argv[i]);
+    }
+
+  mark_done(&queue);
+
   bool status = true;
   do
     status &= grep_command_line_arg (*files++);
   while (*files);
+
+    for (long i = 0; i < num_threads; i++) {
+      pthread_join(threads[i], NULL);
+  }
+
+  free(threads);
+  destroy_queue(&queue);
 
   return errseen ? EXIT_TROUBLE : status;
 }

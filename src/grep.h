@@ -21,6 +21,7 @@
 #define GREP_GREP_H 1
 
 #include <idx.h>
+#include <pthread.h>
 
 /* The following flags are exported from grep for the matchers
    to look at. */
