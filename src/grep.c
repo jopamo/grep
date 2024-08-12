@@ -129,6 +129,9 @@ typedef struct
 }
 task_queue_t;
 
+static pthread_mutex_t filename_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Hash and compare newline-terminated patterns for textual equality.
    Patterns are represented by origin-1 offsets into PATTERN_ARRAY,
    cast to void *.  The origin-1 is so that the first pattern offset
@@ -1133,9 +1136,11 @@ nlscan (char const *lim)
 static void
 print_filename (void)
 {
-  pr_sgr_start_if (filename_color);
-  fputs_errno (input_filename ());
-  pr_sgr_end_if (filename_color);
+  pthread_mutex_lock(&filename_mutex);
+  pr_sgr_start_if(filename_color);
+  fputs_errno(input_filename());
+  pr_sgr_end_if(filename_color);
+  pthread_mutex_unlock(&filename_mutex);
 }
 
 /* Print a character separator.  */
@@ -1310,9 +1315,14 @@ prline (char *beg, char *lim, char sep)
   const char *line_color;
   const char *match_color;
 
+  pthread_mutex_lock(&output_mutex);
+
   if (!only_matching)
     if (! print_line_head (beg, lim - beg - 1, lim, sep))
+    {
+      pthread_mutex_unlock(&output_mutex);
       return;
+    }
 
   matching = (sep == SEP_CHAR_SELECTED) ^ out_invert;
 
@@ -1335,7 +1345,10 @@ prline (char *beg, char *lim, char sep)
         {
           beg = print_line_middle (beg, lim, line_color, match_color);
           if (! beg)
-            return;
+            {
+               pthread_mutex_unlock(&output_mutex);
+               return;
+            }
         }
 
       if (!only_matching && *line_color)
@@ -1356,6 +1369,8 @@ prline (char *beg, char *lim, char sep)
     die (EXIT_TROUBLE, stdout_errno, _("write error"));
 
   lastout = lim;
+
+  pthread_mutex_unlock(&output_mutex);
 }
 
 /* Print pending lines of trailing context prior to LIM.  */
@@ -1667,304 +1682,255 @@ grep (int fd, struct stat const *st, bool *ineof)
 }
 
 static bool
-grepdirent (FTS *fts, FTSENT *ent, bool command_line)
+grepdirent(FTS *fts, FTSENT *ent, bool command_line)
 {
-  bool follow;
-  command_line &= ent->fts_level == FTS_ROOTLEVEL;
+    bool follow;
+    command_line &= ent->fts_level == FTS_ROOTLEVEL;
 
-  if (ent->fts_info == FTS_DP)
-    return true;
+    if (ent->fts_info == FTS_DP)
+        return true;
 
-  if (!command_line
-      && skipped_file (ent->fts_name, false,
-                       (ent->fts_info == FTS_D || ent->fts_info == FTS_DC
-                        || ent->fts_info == FTS_DNR)))
+    if (!command_line && skipped_file(ent->fts_name, false,
+        (ent->fts_info == FTS_D || ent->fts_info == FTS_DC || ent->fts_info == FTS_DNR)))
     {
-      fts_set (fts, ent, FTS_SKIP);
-      return true;
+        fts_set(fts, ent, FTS_SKIP);
+        return true;
     }
 
-  filename = ent->fts_path;
-  if (omit_dot_slash && filename[1])
-    filename += 2;
-  follow = (fts->fts_options & FTS_LOGICAL
-            || (fts->fts_options & FTS_COMFOLLOW && command_line));
+    pthread_mutex_lock(&filename_mutex);
+    filename = ent->fts_path;
+    if (omit_dot_slash && filename[1])
+        filename += 2;
+    pthread_mutex_unlock(&filename_mutex);
 
-  switch (ent->fts_info)
+    follow = (fts->fts_options & FTS_LOGICAL
+        || (fts->fts_options & FTS_COMFOLLOW && command_line));
+
+    switch (ent->fts_info)
     {
     case FTS_D:
-      if (directories == RECURSE_DIRECTORIES)
-        return true;
-      fts_set (fts, ent, FTS_SKIP);
-      break;
+        if (directories == RECURSE_DIRECTORIES)
+            return true;
+        fts_set(fts, ent, FTS_SKIP);
+        break;
 
     case FTS_DC:
-      if (!suppress_errors)
-        error (0, 0, _("%s: warning: recursive directory loop"), filename);
-      return true;
+        if (!suppress_errors)
+            error(0, 0, _("%s: warning: recursive directory loop"), filename);
+        return true;
 
     case FTS_DNR:
     case FTS_ERR:
     case FTS_NS:
-      suppressible_error (ent->fts_errno);
-      return true;
+        suppressible_error(ent->fts_errno);
+        return true;
 
     case FTS_DEFAULT:
     case FTS_NSOK:
-      if (skip_devices (command_line))
+        if (skip_devices(command_line))
         {
-          struct stat *st = ent->fts_statp;
-          struct stat st1;
-          if (! st->st_mode)
+            struct stat *st = ent->fts_statp;
+            struct stat st1;
+            if (!st->st_mode)
             {
-              /* The file type is not already known.  Get the file status
-                 before opening, since opening might have side effects
-                 on a device.  */
-              int flag = follow ? 0 : AT_SYMLINK_NOFOLLOW;
-              if (fstatat (fts->fts_cwd_fd, ent->fts_accpath, &st1, flag) != 0)
+                int flag = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+                if (fstatat(fts->fts_cwd_fd, ent->fts_accpath, &st1, flag) != 0)
                 {
-                  suppressible_error (errno);
-                  return true;
+                    suppressible_error(errno);
+                    return true;
                 }
-              st = &st1;
+                st = &st1;
             }
-          if (is_device_mode (st->st_mode))
-            return true;
+            if (is_device_mode(st->st_mode))
+                return true;
         }
-      break;
+        break;
 
     case FTS_F:
     case FTS_SLNONE:
-      break;
+        break;
 
     case FTS_SL:
     case FTS_W:
-      return true;
+        return true;
 
     default:
-      abort ();
+        abort();
     }
 
-  return grepfile (fts->fts_cwd_fd, ent->fts_accpath, follow, command_line);
+    return grepfile(fts->fts_cwd_fd, ent->fts_accpath, follow, command_line);
 }
 
-/* True if errno is ERR after 'open ("symlink", ... O_NOFOLLOW ...)'.
-   POSIX specifies ELOOP, but it's EMLINK on FreeBSD and EFTYPE on NetBSD.  */
 static bool
-open_symlink_nofollow_error (int err)
+open_symlink_nofollow_error(int err)
 {
-  if (err == ELOOP || err == EMLINK)
-    return true;
+    if (err == ELOOP || err == EMLINK)
+        return true;
 #ifdef EFTYPE
-  if (err == EFTYPE)
-    return true;
+    if (err == EFTYPE)
+        return true;
 #endif
-  return false;
+    return false;
 }
 
 static bool
-grepfile (int dirdesc, char const *name, bool follow, bool command_line)
+grepfile(int dirdesc, char const *name, bool follow, bool command_line)
 {
-  int oflag = (O_RDONLY | O_NOCTTY
-               | (IGNORE_DUPLICATE_BRANCH_WARNING
-                  (binary ? O_BINARY : 0))
-               | (follow ? 0 : O_NOFOLLOW)
-               | (skip_devices (command_line) ? O_NONBLOCK : 0));
-  int desc = openat_safer (dirdesc, name, oflag);
-  if (desc < 0)
+    int oflag = (O_RDONLY | O_NOCTTY
+        | (IGNORE_DUPLICATE_BRANCH_WARNING
+            (binary ? O_BINARY : 0))
+        | (follow ? 0 : O_NOFOLLOW)
+        | (skip_devices(command_line) ? O_NONBLOCK : 0));
+    int desc = openat_safer(dirdesc, name, oflag);
+    if (desc < 0)
     {
-      if (follow || ! open_symlink_nofollow_error (errno))
-        suppressible_error (errno);
-      return true;
+        if (follow || !open_symlink_nofollow_error(errno))
+            suppressible_error(errno);
+        return true;
     }
-  return grepdesc (desc, command_line);
+    return grepdesc(desc, command_line);
 }
 
-/* Read all data from FD, with status ST.  Return true if successful,
-   false (setting errno) otherwise.  */
 static bool
-drain_input (int fd, struct stat const *st)
+drain_input(int fd, struct stat const *st)
 {
-  ssize_t nbytes;
-  if (S_ISFIFO (st->st_mode) && dev_null_output)
+    ssize_t nbytes;
+    if (S_ISFIFO(st->st_mode) && dev_null_output)
     {
 #ifdef SPLICE_F_MOVE
-      /* Should be faster, since it need not copy data to user space.  */
-      nbytes = splice (fd, nullptr, STDOUT_FILENO, nullptr,
-                       INITIAL_BUFSIZE, SPLICE_F_MOVE);
-      if (0 <= nbytes || errno != EINVAL)
+        nbytes = splice(fd, nullptr, STDOUT_FILENO, nullptr, INITIAL_BUFSIZE, SPLICE_F_MOVE);
+        if (0 <= nbytes || errno != EINVAL)
         {
-          while (0 < nbytes)
-            nbytes = splice (fd, nullptr, STDOUT_FILENO, nullptr,
-                             INITIAL_BUFSIZE, SPLICE_F_MOVE);
-          return nbytes == 0;
+            while (0 < nbytes)
+                nbytes = splice(fd, nullptr, STDOUT_FILENO, nullptr, INITIAL_BUFSIZE, SPLICE_F_MOVE);
+            return nbytes == 0;
         }
 #endif
     }
-  while ((nbytes = safe_read (fd, buffer, bufalloc)))
-    if (nbytes == SAFE_READ_ERROR)
-      return false;
-  return true;
+    while ((nbytes = safe_read(fd, buffer, bufalloc)))
+        if (nbytes == SAFE_READ_ERROR)
+            return false;
+    return true;
 }
 
-/* Finish reading from FD, with status ST and where end-of-file has
-   been seen if INEOF.  Typically this is a no-op, but when reading
-   from standard input this may adjust the file offset or drain a
-   pipe.  */
-
 static void
-finalize_input (int fd, struct stat const *st, bool ineof)
+finalize_input(int fd, struct stat const *st, bool ineof)
 {
-  if (fd == STDIN_FILENO
-      && (outleft
-          ? (!ineof
-             && (seek_failed
-                 || (lseek (fd, 0, SEEK_END) < 0
-                     /* Linux proc file system has EINVAL (Bug#25180).  */
-                     && errno != EINVAL))
-             && ! drain_input (fd, st))
-          : (bufoffset != after_last_match && !seek_failed
-             && lseek (fd, after_last_match, SEEK_SET) < 0)))
-    suppressible_error (errno);
+    if (fd == STDIN_FILENO
+        && (outleft
+            ? (!ineof
+                && (seek_failed
+                    || (lseek(fd, 0, SEEK_END) < 0
+                        && errno != EINVAL))
+                && !drain_input(fd, st))
+            : (bufoffset != after_last_match && !seek_failed
+                && lseek(fd, after_last_match, SEEK_SET) < 0)))
+        suppressible_error(errno);
 }
 
 static bool
-grepdesc (int desc, bool command_line)
+grepdesc(int desc, bool command_line)
 {
-  intmax_t count;
-  bool status = true;
-  bool ineof = false;
-  struct stat st;
+    intmax_t count;
+    bool status = true;
+    bool ineof = false;
+    struct stat st;
 
-  /* Get the file status, possibly for the second time.  This catches
-     a race condition if the directory entry changes after the
-     directory entry is read and before the file is opened.  For
-     example, normally DESC is a directory only at the top level, but
-     there is an exception if some other process substitutes a
-     directory for a non-directory while 'grep' is running.  */
-  if (fstat (desc, &st) != 0)
+    if (fstat(desc, &st) != 0)
     {
-      suppressible_error (errno);
-      goto closeout;
+        suppressible_error(errno);
+        goto closeout;
     }
 
-  if (desc != STDIN_FILENO && skip_devices (command_line)
-      && is_device_mode (st.st_mode))
-    goto closeout;
+    if (desc != STDIN_FILENO && skip_devices(command_line)
+        && is_device_mode(st.st_mode))
+        goto closeout;
 
-  if (desc != STDIN_FILENO && command_line
-      && skipped_file (filename, true, S_ISDIR (st.st_mode) != 0))
-    goto closeout;
+    if (desc != STDIN_FILENO && command_line
+        && skipped_file(filename, true, S_ISDIR(st.st_mode) != 0))
+        goto closeout;
 
-  /* Don't output file names if invoked as 'grep -r PATTERN NONDIRECTORY'.  */
-  if (out_file < 0)
-    out_file = !!S_ISDIR (st.st_mode);
-
-  if (desc != STDIN_FILENO
-      && directories == RECURSE_DIRECTORIES && S_ISDIR (st.st_mode))
+    if (out_file < 0)
     {
-      /* Traverse the directory starting with its full name, because
-         unfortunately fts provides no way to traverse the directory
-         starting from its file descriptor.  */
-
-      FTS *fts;
-      FTSENT *ent;
-      int opts = fts_options & ~(command_line ? 0 : FTS_COMFOLLOW);
-      char *fts_arg[2];
-
-      /* Close DESC now, to conserve file descriptors if the race
-         condition occurs many times in a deep recursion.  */
-      if (close (desc) != 0)
-        suppressible_error (errno);
-
-      fts_arg[0] = (char *) filename;
-      fts_arg[1] = nullptr;
-      fts = fts_open (fts_arg, opts, nullptr);
-
-      if (!fts)
-        xalloc_die ();
-      while ((ent = fts_read (fts)))
-        status &= grepdirent (fts, ent, command_line);
-      if (errno)
-        suppressible_error (errno);
-      if (fts_close (fts) != 0)
-        suppressible_error (errno);
-      return status;
-    }
-  if (desc != STDIN_FILENO
-      && ((directories == SKIP_DIRECTORIES && S_ISDIR (st.st_mode))
-          || ((devices == SKIP_DEVICES
-               || (devices == READ_COMMAND_LINE_DEVICES && !command_line))
-              && is_device_mode (st.st_mode))))
-    goto closeout;
-
-  /* If there is a regular file on stdout and the current file refers
-     to the same i-node, we have to report the problem and skip it.
-     Otherwise when matching lines from some other input reach the
-     disk before we open this file, we can end up reading and matching
-     those lines and appending them to the file from which we're reading.
-     Then we'd have what appears to be an infinite loop that'd terminate
-     only upon filling the output file system or reaching a quota.
-     However, there is no risk of an infinite loop if grep is generating
-     no output, i.e., with --silent, --quiet, -q.
-     Similarly, with any of these:
-       --max-count=N (-m) (for N >= 2)
-       --files-with-matches (-l)
-       --files-without-match (-L)
-     there is no risk of trouble.
-     For --max-count=1, grep stops after printing the first match,
-     so there is no risk of malfunction.  But even --max-count=2, with
-     input==output, while there is no risk of infloop, there is a race
-     condition that could result in "alternate" output.  */
-  if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
-      && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
-    {
-      if (! suppress_errors)
-        error (0, 0, _("%s: input file is also the output"), input_filename ());
-      errseen = true;
-      goto closeout;
+        pthread_mutex_lock(&output_mutex);
+        out_file = !!S_ISDIR(st.st_mode);
+        pthread_mutex_unlock(&output_mutex);
     }
 
-  count = grep (desc, &st, &ineof);
-  if (count_matches)
+    if (desc != STDIN_FILENO
+        && directories == RECURSE_DIRECTORIES && S_ISDIR(st.st_mode))
     {
-      if (out_file)
+        FTS *fts;
+        FTSENT *ent;
+        int opts = fts_options & ~(command_line ? 0 : FTS_COMFOLLOW);
+        char *fts_arg[2];
+
+        if (close(desc) != 0)
+            suppressible_error(errno);
+
+        fts_arg[0] = (char *)filename;
+        fts_arg[1] = nullptr;
+        fts = fts_open(fts_arg, opts, nullptr);
+
+        if (!fts)
+            xalloc_die();
+        while ((ent = fts_read(fts)))
+            status &= grepdirent(fts, ent, command_line);
+        if (errno)
+            suppressible_error(errno);
+        if (fts_close(fts) != 0)
+            suppressible_error(errno);
+        return status;
+    }
+    if (desc != STDIN_FILENO
+        && ((directories == SKIP_DIRECTORIES && S_ISDIR(st.st_mode))
+            || ((devices == SKIP_DEVICES
+                || (devices == READ_COMMAND_LINE_DEVICES && !command_line))
+                && is_device_mode(st.st_mode))))
+        goto closeout;
+
+    count = grep(desc, &st, &ineof);
+    if (count_matches)
+    {
+        if (out_file)
         {
-          print_filename ();
-          if (filename_mask)
-            print_sep (SEP_CHAR_SELECTED);
-          else
-            putchar_errno (0);
+            print_filename();
+            if (filename_mask)
+                print_sep(SEP_CHAR_SELECTED);
+            else
+                putchar_errno(0);
         }
-      printf_errno ("%" PRIdMAX "\n", count);
-      if (line_buffered)
-        fflush_errno ();
+        printf_errno("%" PRIdMAX "\n", count);
+        if (line_buffered)
+            fflush_errno();
     }
 
-  status = !count;
+    status = !count;
 
-  if (list_files == LISTFILES_NONE)
-    finalize_input (desc, &st, ineof);
-  else if (list_files == (status ? LISTFILES_NONMATCHING : LISTFILES_MATCHING))
+    if (list_files == LISTFILES_NONE)
+        finalize_input(desc, &st, ineof);
+    else if (list_files == (status ? LISTFILES_NONMATCHING : LISTFILES_MATCHING))
     {
-      print_filename ();
-      putchar_errno ('\n' & filename_mask);
-      if (line_buffered)
-        fflush_errno ();
+        print_filename();
+        putchar_errno('\n' & filename_mask);
+        if (line_buffered)
+            fflush_errno();
     }
 
- closeout:
-  if (desc != STDIN_FILENO && close (desc) != 0)
-    suppressible_error (errno);
-  return status;
+closeout:
+    if (desc != STDIN_FILENO && close(desc) != 0)
+        suppressible_error(errno);
+    return status;
 }
 
 static bool
 grep_command_line_arg (char const *arg)
 {
+  pthread_mutex_lock(&filename_mutex);
   if (STREQ (arg, "-"))
     {
       filename = label;
+      pthread_mutex_unlock(&filename_mutex);
       if (binary)
         xset_binary_mode (STDIN_FILENO, O_BINARY);
       return grepdesc (STDIN_FILENO, true);
@@ -1972,6 +1938,7 @@ grep_command_line_arg (char const *arg)
   else
     {
       filename = arg;
+      pthread_mutex_unlock(&filename_mutex);
       return grepfile (AT_FDCWD, arg, true, true);
     }
 }
